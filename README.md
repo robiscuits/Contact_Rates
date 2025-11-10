@@ -1,4 +1,4 @@
-````markdown
+
 # Bayesian Contact Rate Model (MAP Estimation)
 
 ## Overview
@@ -75,4 +75,3 @@ Robert George
 Chicago, IL
 [rrgeorge00@gmail.com]
 
-````
