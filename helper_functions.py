@@ -1,8 +1,8 @@
 import pandas as pd
 import numpy as np
 import pymc as pm
-import pytensor.tensor as pt
-
+from scipy.special import logit
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, log_loss, brier_score_loss
 
 def collapse_pitch_families(df, fastballs, breaking, offspeed):
     # Whiff
@@ -27,98 +27,199 @@ def collapse_pitch_families(df, fastballs, breaking, offspeed):
             df[f'mix_{fam}'] = df[cols].sum(axis=1)  # sum since mix_% already sum to 1
 
     # Drop original pitch-type columns
-    drop_cols = [c for c in df.columns if any(c.startswith(prefix) for prefix in ['whiff_', 'velo_', 'mix_']) and not any(fam in c for fam in ['fastball', 'breaking', 'offspeed'])]
+    drop_cols = [
+        c for c in df.columns
+        if any(c.startswith(prefix) for prefix in ['whiff_', 'velo_', 'mix_'])
+        and not any(fam in c for fam in ['fastball', 'breaking', 'offspeed'])
+    ]
     df = df.drop(columns=drop_cols, errors='ignore')
 
     return df
 
-def prepare_timeseries_data(df, df_features, on, cutoff, eps=1e-6, sigma0=1.0, c=10.0):
-    df_model= df.merge(df_features, on=on, how='left')
-    #Define weeks
-    df_model['season_week'] = df_model['pitch_date'].dt.isocalendar().week.astype(int)
 
-    # weekly counts per batter
-    wk = (df_model.groupby(['batter_id','season_week'])
-            .agg(y_it = ('contact','sum'),
-                 n_it = ('is_swing','sum'))
-            .reset_index())
-    #Standardize week values so that gaps are reduced
-    #Opportunity for future development: Incorporate missing stretches into model
-    wk = wk.sort_values(['batter_id','season_week'])
-    wk['t'] = wk.groupby('batter_id').cumcount()
+def prepare_timeseries_data(df, df_features, on, train=True,
+                            eps=1e-6, sigma0=1.0, c=10.0):
+    """
+    Prepare aligned training or test data for the Bayesian contact model.
+
+    Arguments:
+        df : pitch-level data (must include pitch_date, contact, is_swing, batter_id)
+        df_features : per-batter feature table
+        on : join key(s)
+        train : if True, returns data through June; if False, after June
+        eps : small value to avoid log(0)
+        sigma0, c : prior shrinkage parameters
+
+    Returns:
+        X, y, n, batter_idx, logit_prev, sigma_theta0_i
+    """
+
     cutoff = pd.Timestamp('2024-07-01')
+    df = df.copy()
+    df['pitch_date'] = pd.to_datetime(df['pitch_date'])
 
-    # mark each week by its start date (Mon) to compare to cutoff
-    week_start = (df_model[['season_week','pitch_date']]
-                  .drop_duplicates('season_week')
-                  .groupby('season_week')['pitch_date'].min())
-    wk = wk.merge(week_start.rename('week_start'), on='season_week', how='left')
+    # Merge in features
+    df_features = df_features.copy()
+    assert 'batter_id' in df_features.columns
 
-    wk_train = wk[wk['week_start'] < cutoff]
-    wk_test  = wk[wk['week_start'] >= cutoff]
-    
-    # List our batters
-    batters = pd.DataFrame({'batter_id': df['batter_id'].unique()}).sort_values('batter_id').reset_index(drop=True)
-    batters['i'] = np.arange(len(batters))
-
-    wk_train = wk_train.merge(batters, on='batter_id', how='right')  # keep all batters, NaN for missing weeks
-    wk_train[['y_it','n_it']] = wk_train[['y_it','n_it']].fillna(0)
-
-    # compute each batter's max t in train, then set a common T_train for full matrix form
-    T_train = int(wk_train.groupby('i')['t'].max().fillna(-1).max() + 1)
-    I = len(batters)
-
-    # make dense matrices (I x T_train); weeks with no data have n=0, y=0
-    y_mat = np.zeros((I, T_train), dtype=int)
-    n_mat = np.zeros((I, T_train), dtype=int)
-
-    for row in wk_train.itertuples(index=False):
-        if pd.notna(row.t):
-            y_mat[row.i, int(row.t)] = int(row.y_it)
-            n_mat[row.i, int(row.t)] = int(row.n_it)
-
-    # Reset X
-    X =  df_features.drop(columns=['contact_rate', 'z_contact_rate','o_contact_rate'], errors='ignore')
-    
-    model_features = batters.merge(X, on='batter_id', how='left').fillna(0)
-    X_i = model_features.to_numpy() #This is our feature row for each batter. It's not repeated t times yet.
-    
-    # Calculating priors
-    prev = batters.merge(
-        df[['batter_id','contact_rate_2023','total_swings_2023']].drop_duplicates(subset='batter_id'),
-        on='batter_id', how='left'
+    # Weekly aggregates
+    wk = (
+        df.groupby(['batter_id', pd.Grouper(key='pitch_date', freq='W-MON')])
+          .agg(y_it=('contact', 'sum'),
+               n_it=('is_swing', 'sum'))
+          .reset_index()
+          .rename(columns={'pitch_date': 'week_start'})
     )
 
-    p_prev = prev['contact_rate_2023'].fillna(prev['contact_rate_2023'].mean()).clip(eps,1-eps)
-    logit_prev = np.log(p_prev/(1-p_prev))  # or use your stored 'logit_prev'
+    # Split by cutoff
+    wk_train = wk[wk['week_start'] < cutoff].copy()
+    wk_test  = wk[wk['week_start'] >= cutoff].copy()
 
-    n_prev = prev['total_swings_2023'].fillna(0).to_numpy()
-    logit_prev = logit_prev.to_numpy()
+    # Identify all batters who have ANY data before cutoff (rookies included)
+    pre_cutoff_batters = set(wk_train['batter_id'].unique())
 
-    # prior SD that shrinks with prior swings
+    # Filter out true post-July rookies
+    wk_test = wk_test[wk_test['batter_id'].isin(pre_cutoff_batters)].copy()
+
+    # Build index from all batters who appeared before cutoff
+    batters = (
+        wk[wk['batter_id'].isin(pre_cutoff_batters)][['batter_id']]
+        .drop_duplicates()
+        .sort_values('batter_id')
+        .reset_index(drop=True)
+    )
+    batters['batter_idx'] = np.arange(len(batters))
+
+    # Choose subset for this run
+    wk_use = wk_train if train else wk_test
+
+    # Merge batter index and features
+    wk_use = wk_use.merge(batters, on='batter_id', how='left')
+    wk_use = wk_use.merge(df_features, on='batter_id', how='left')
+
+    # Fill and filter
+    wk_use['y_it'] = wk_use['y_it'].fillna(0).astype(int)
+    wk_use['n_it'] = wk_use['n_it'].fillna(0).astype(int)
+    wk_use = wk_use[wk_use['n_it'] > 0].copy()
+
+    # Build numeric feature matrix
+    drop_cols = {
+        'batter_id', 'batter_idx', 'week_start',
+        'y_it', 'n_it', 'contact_rate_2023', 'total_swings_2023'
+    }
+    X_df = wk_use.drop(columns=[c for c in drop_cols if c in wk_use.columns])
+    X_df = X_df.select_dtypes(include=[np.number]).fillna(0)
+
+    X = X_df.to_numpy(dtype=np.float64)
+    y = wk_use['y_it'].to_numpy(dtype=np.int64)
+    n = wk_use['n_it'].to_numpy(dtype=np.int64)
+    batter_idx = wk_use['batter_idx'].to_numpy(dtype=np.int64)
+
+    # Priors from 2023, aligned with all pre-cutoff batters
+    prev = (
+        df[['batter_id', 'contact_rate_2023', 'total_swings_2023']]
+        .drop_duplicates('batter_id')
+        .merge(batters, on='batter_id', how='right')
+        .sort_values('batter_idx')
+    )
+
+    league_avg = prev['contact_rate_2023'].dropna().mean()
+    p_prev = prev['contact_rate_2023'].fillna(league_avg).clip(eps, 1 - eps)
+    n_prev = prev['total_swings_2023'].fillna(0)
+
+    logit_prev = np.log(p_prev / (1 - p_prev))
     sigma_theta0_i = sigma0 / np.sqrt(n_prev + c)
+
+    print(f"[prep] {'TRAIN' if train else 'TEST'}: "
+          f"N={len(y)}, I={len(batters)}, K={X.shape[1]}")
+    print(f"[prep] Rookies kept: {len(pre_cutoff_batters)} hitters through June.")
+    print(f"[prep] Post-July rookies dropped automatically.")
+
+    return X, y, n, batter_idx, logit_prev, sigma_theta0_i
+
+
+def call_model(X, y, n, batter_idx, logit_prev, sigma_theta0_i):
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.int64)
+    n = np.asarray(n, dtype=np.int64)
+    batter_idx = np.asarray(batter_idx, dtype=np.int64)
+    logit_prev = np.asarray(logit_prev, dtype=np.float64)
+    sigma_theta0_i = np.asarray(sigma_theta0_i, dtype=np.float64)
+
+    N, K = X.shape
+    I = logit_prev.shape[0]
+
+    with pm.Model() as model:
+        # Per-batter baseline ability
+        alpha = pm.Normal(
+            "alpha",
+            mu=logit_prev,
+            sigma=sigma_theta0_i,
+            shape=I,
+        )
+
+        # Global feature effects
+        beta = pm.Normal("beta", mu=0.0, sigma=1.0, shape=K)
+
+        # Linear predictor
+        eta = alpha[batter_idx] + pm.math.dot(X, beta)
+
+        # Binomial likelihood
+        p = pm.math.sigmoid(eta)
+        pm.Binomial("y_obs", n=n, p=p, observed=y)
+
+        print("Running MAP estimation...")
+        map_estimate = pm.find_MAP(progressbar=True)
+        print("MAP estimation complete.")
+
+    return map_estimate
+
+def weighted_metrics(actual, pred, weights, eps=1e-9):
+    """
+    Compute weighted model performance metrics for probabilistic predictions.
     
-    return y_mat, n_mat, X_i, sigma_theta0_i, logit_prev
+    Parameters:
+        actual  : array-like, actual contact rates (y/n)
+        pred    : array-like, predicted probabilities
+        weights : array-like, swing counts or sample weights
+        eps     : float, small value to stabilize logs and divisions
+    """
+    actual, pred, w = np.asarray(actual), np.asarray(pred), np.asarray(weights)
+    w = w / (w.sum() + eps)
 
-def call_model(K, logit_prev, sigma_theta0_i, I, T, X_i, n_mat, y_mat):
-    with pm.Model() as rw_model:
-        # Priors
-        sigma_rw = pm.HalfNormal("sigma_rw", 0.5)
-        beta = pm.Normal("beta", 0, 1, shape=K)
+    # Weighted means
+    mean_actual = np.sum(w * actual)
+    mean_pred = np.sum(w * pred)
 
-        # Initial contact ability θ_i0
-        theta0 = pm.Normal("theta0", mu=logit_prev, sigma=sigma_theta0_i, shape=I)
+    # Weighted covariance and correlation
+    cov = np.sum(w * (actual - mean_actual) * (pred - mean_pred))
+    var_actual = np.sum(w * (actual - mean_actual)**2)
+    var_pred = np.sum(w * (pred - mean_pred)**2)
+    weighted_corr = cov / np.sqrt(var_actual * var_pred + eps)
 
-        # Random walk noise
-        eps = pm.Normal("eps", 0, sigma_rw, shape=(I, T))
+    # Weighted R²
+    ss_tot = np.sum(w * (actual - mean_actual)**2)
+    ss_res = np.sum(w * (actual - pred)**2)
+    weighted_r2 = 1 - ss_res / (ss_tot + eps)
 
-        # Build θ recursively
-        theta = pt.zeros((I, T))
-        theta = pt.set_subtensor(theta[:, 0], theta0 + eps[:, 0])
-        theta = pm.Deterministic("theta", pt.inc_subtensor(theta[:, 1:], theta[:, :-1] + eps[:, 1:]))
+    # Weighted MSE, RMSE, MAE
+    mse = np.sum(w * (actual - pred)**2)
+    rmse = np.sqrt(mse)
+    mae = np.sum(w * np.abs(actual - pred))
 
-        # Link to probability
-        p = pm.Deterministic("p", pm.math.sigmoid(theta + X_i @ beta))
+    # Log loss and Brier score (requires binary outcomes, but still informative here)
+    binary_actual = (actual > 0.5).astype(int)
+    logloss = log_loss(binary_actual, np.clip(pred, eps, 1 - eps), sample_weight=weights)
+    brier = brier_score_loss(binary_actual, pred, sample_weight=weights)
 
-        # Likelihood
-        y_obs = pm.Binomial("y_obs", n=n_mat, p=p, observed=y_mat)
+    # Pack results
+    return {
+        "Weighted Corr": weighted_corr,
+        "Weighted R²": weighted_r2,
+        "MSE": mse,
+        "RMSE": rmse,
+        "MAE": mae,
+        "Log Loss": logloss,
+        "Brier Score": brier
+    }
+
