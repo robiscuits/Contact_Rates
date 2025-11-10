@@ -1,4 +1,3 @@
-
 ````markdown
 # Bayesian Contact Rate Model (MAP Estimation)
 
