@@ -7,9 +7,8 @@ This project builds a Bayesian model to estimate and predict MLB hitter contact 
 Originally designed as a dynamic random-walk model, this implementation focuses on the static MAP form to efficiently estimate midseason contact ability. Each hitter’s prior is informed by their 2023 contact rate and total swings, with shrinkage applied based on prior sample size. Feature variables act as shared global effects, while per-hitter intercepts represent individual baseline contact performance.
 
 ## Repository Structure
-- `main.ipynb` - Full analysis notebook (training, testing, evaluation)
-- `main.html` - Rendered HTML report (primary deliverable)
-- `main.py` - Core data preparation and model definition
+- `deliverable.ipynb` - Full analysis notebook (training, testing, evaluation)
+- `deliverable.html` - Rendered HTML report (primary deliverable)
 - `helper_functions.py` - Supporting utilities and preprocessing helpers
 - `requirements.txt` - Python package dependencies
 - `README.md` - Project overview and setup guide
